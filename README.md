@@ -105,3 +105,8 @@ detection and uses that port.
 `stand/` has a 45° desk stand that replaces the knob's white back plate and reuses its two
 screws. Print-ready STL and 3MF files are included, along with a STEP file and the Fusion 360
 script that generates them. See [stand/README.md](stand/README.md).
+
+## License
+
+[MIT](LICENSE). The libraries the firmware and the companion pull in at build time (LVGL,
+LovyanGFX, Adafruit NeoPixel, NAudio) keep their own licenses.
