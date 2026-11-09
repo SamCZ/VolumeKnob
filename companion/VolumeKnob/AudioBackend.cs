@@ -25,8 +25,20 @@ sealed class AudioBackend : IDisposable
     readonly MMDeviceEnumerator enumerator = new();
     MMDevice? device;
     string? deviceId;
+    string deviceName = "";
     bool deviceFixedVolume;
     long nextDeviceCheckMs;
+    AudioSessionManager? sessionManager;
+
+    const int SessionReloadMs = 60_000; // safety pass; new sessions normally arrive by notification
+    const int SessionReloadMinMs = 500;
+
+    // The current device's sessions. Kept across polls: see ReloadSessions.
+    sealed record CachedSession(AudioSessionControl Control, uint? Pid, string Key, string Name, uint IconKey);
+    readonly List<CachedSession> cachedSessions = new();
+    volatile bool sessionsDirty = true;
+    long lastSessionReloadMs;
+    long nextSessionReloadMs;
 
     // Group key (lower-case exe path, "#system", or "pid:N") -> stable id for the knob.
     readonly Dictionary<string, int> idByKey = new();
@@ -51,8 +63,6 @@ sealed class AudioBackend : IDisposable
     public MixerSnapshot Poll()
     {
         EnsureDevice();
-        foreach (var list in sessionsById.Values)
-            foreach (var s in list) s.Dispose();
         sessionsById = new Dictionary<int, List<AudioSessionControl>>();
 
         if (device == null)
@@ -62,59 +72,32 @@ sealed class AudioBackend : IDisposable
         int masterVolume = ToPercent(endpoint.MasterVolumeLevelScalar);
         bool masterMuted = endpoint.Mute;
 
-        var manager = device.AudioSessionManager;
-        manager.RefreshSessions();
-        var sessions = manager.Sessions;
+        long now = Environment.TickCount64;
+        if (now >= nextSessionReloadMs || (sessionsDirty && now >= lastSessionReloadMs + SessionReloadMinMs))
+            ReloadSessions(now);
 
         var groups = new List<(string Key, string Name, uint IconKey, List<AudioSessionControl> Sessions)>();
         var groupIndex = new Dictionary<string, int>();
 
-        for (int i = 0; i < sessions.Count; i++)
+        for (int i = cachedSessions.Count - 1; i >= 0; i--)
         {
-            AudioSessionControl session = sessions[i];
-            string key, name;
-            uint iconKey;
-            try
+            var cached = cachedSessions[i];
+            if (IsGone(cached))
             {
-                if (session.State == NAudio.CoreAudioApi.Interfaces.AudioSessionState.AudioSessionStateExpired)
-                {
-                    session.Dispose();
-                    continue;
-                }
-                if (session.IsSystemSoundsSession)
-                {
-                    key = "#system";
-                    name = "System Sounds";
-                    iconKey = IconSystem;
-                }
-                else
-                {
-                    uint pid = session.GetProcessID;
-                    var info = GetProcess(pid);
-                    if (info == null) // process exited; Windows hides these sessions too
-                    {
-                        session.Dispose();
-                        continue;
-                    }
-                    key = info.Path?.ToLowerInvariant() ?? $"pid:{pid}";
-                    name = DisplayName(session, info);
-                    iconKey = info.Path != null ? GetIconKey(info.Path) : IconNone;
-                }
+                cached.Control.Dispose();
+                cachedSessions.RemoveAt(i);
             }
-            catch (Exception e)
-            {
-                Log.Write($"session read failed: {e.Message}");
-                session.Dispose();
-                continue;
-            }
+        }
 
-            if (!groupIndex.TryGetValue(key, out int gi))
+        foreach (var cached in cachedSessions)
+        {
+            if (!groupIndex.TryGetValue(cached.Key, out int gi))
             {
                 gi = groups.Count;
-                groupIndex[key] = gi;
-                groups.Add((key, name, iconKey, new List<AudioSessionControl>()));
+                groupIndex[cached.Key] = gi;
+                groups.Add((cached.Key, cached.Name, cached.IconKey, new List<AudioSessionControl>()));
             }
-            groups[gi].Sessions.Add(session);
+            groups[gi].Sessions.Add(cached.Control);
         }
 
         // System Sounds first, like the Windows mixer; the rest in session order.
@@ -123,13 +106,27 @@ sealed class AudioBackend : IDisposable
         var apps = new List<AppEntry>(groups.Count);
         foreach (var g in groups)
         {
+            int volume;
+            bool muted;
+            try
+            {
+                var first = g.Sessions[0].SimpleAudioVolume;
+                volume = ToPercent(first.Volume);
+                muted = first.Mute;
+            }
+            catch (Exception e)
+            {
+                Log.Write($"session read failed: {e.Message}");
+                sessionsDirty = true;
+                continue;
+            }
+
             if (!idByKey.TryGetValue(g.Key, out int id))
             {
                 id = nextId++;
                 idByKey[g.Key] = id;
             }
-            var first = g.Sessions[0].SimpleAudioVolume;
-            apps.Add(new AppEntry(id, g.Name, g.IconKey, ToPercent(first.Volume), first.Mute));
+            apps.Add(new AppEntry(id, g.Name, g.IconKey, volume, muted));
             sessionsById[id] = g.Sessions;
         }
 
@@ -138,8 +135,116 @@ sealed class AudioBackend : IDisposable
             idByKey.Remove(gone);
         PruneProcesses();
 
-        return new MixerSnapshot(masterVolume, masterMuted, deviceFixedVolume, Sanitize(device.FriendlyName, 60), apps);
+        return new MixerSnapshot(masterVolume, masterMuted, deviceFixedVolume, deviceName, apps);
     }
+
+    /// <summary>
+    /// Re-enumerates the device's sessions. RefreshSessions leaks native memory here and in the
+    /// Windows audio service on every call, so this runs only when a session appears, plus a slow
+    /// safety pass in case a notification is missed. Never call it from the regular poll path.
+    /// </summary>
+    void ReloadSessions(long now)
+    {
+        DropSessions();
+        sessionsDirty = false; // cleared first so a session created during the reload isn't lost
+        lastSessionReloadMs = now;
+        nextSessionReloadMs = now + SessionReloadMs;
+
+        try
+        {
+            var manager = device!.AudioSessionManager;
+            manager.RefreshSessions();
+            var sessions = manager.Sessions;
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                var cached = ReadSession(sessions[i]);
+                if (cached != null) cachedSessions.Add(cached);
+            }
+        }
+        catch
+        {
+            sessionsDirty = true;
+            throw;
+        }
+    }
+
+    /// <summary>Reads a session's identity; returns null (and disposes it) if it shouldn't be listed.</summary>
+    CachedSession? ReadSession(AudioSessionControl session)
+    {
+        try
+        {
+            if (session.State == NAudio.CoreAudioApi.Interfaces.AudioSessionState.AudioSessionStateExpired)
+            {
+                session.Dispose();
+                return null;
+            }
+            if (session.IsSystemSoundsSession)
+                return new CachedSession(session, null, "#system", "System Sounds", IconSystem);
+
+            uint pid = session.GetProcessID;
+            var info = GetProcess(pid);
+            if (info == null) // process exited; Windows hides these sessions too
+            {
+                session.Dispose();
+                return null;
+            }
+            return new CachedSession(session, pid, info.Path?.ToLowerInvariant() ?? $"pid:{pid}",
+                DisplayName(session, info), info.Path != null ? GetIconKey(info.Path) : IconNone);
+        }
+        catch (Exception e)
+        {
+            Log.Write($"session read failed: {e.Message}");
+            session.Dispose();
+            return null;
+        }
+    }
+
+    bool IsGone(CachedSession cached)
+    {
+        try
+        {
+            return cached.Control.State == NAudio.CoreAudioApi.Interfaces.AudioSessionState.AudioSessionStateExpired
+                || (cached.Pid is { } pid && GetProcess(pid) == null);
+        }
+        catch (Exception e)
+        {
+            Log.Write($"session read failed: {e.Message}");
+            sessionsDirty = true;
+            return true;
+        }
+    }
+
+    void DropSessions()
+    {
+        foreach (var cached in cachedSessions) cached.Control.Dispose();
+        cachedSessions.Clear();
+    }
+
+    void AttachDevice(MMDevice newDevice)
+    {
+        DetachDevice();
+        device = newDevice;
+        deviceId = newDevice.ID;
+        deviceName = Sanitize(newDevice.FriendlyName, 60);
+        sessionManager = newDevice.AudioSessionManager;
+        sessionManager.OnSessionCreated += OnSessionCreated;
+        sessionsDirty = true;
+        nextSessionReloadMs = 0;
+    }
+
+    void DetachDevice()
+    {
+        DropSessions();
+        sessionsById = new Dictionary<int, List<AudioSessionControl>>();
+        if (sessionManager != null) sessionManager.OnSessionCreated -= OnSessionCreated;
+        sessionManager = null;
+        device?.Dispose();
+        device = null;
+        deviceId = null;
+    }
+
+    // Runs on a Core Audio thread.
+    void OnSessionCreated(object sender, NAudio.CoreAudioApi.Interfaces.IAudioSessionControl newSession) => sessionsDirty = true;
 
     public void SetMaster(int volume, bool muted)
     {
@@ -178,18 +283,14 @@ sealed class AudioBackend : IDisposable
                 current.Dispose();
                 return;
             }
-            device?.Dispose();
-            device = current;
-            deviceId = current.ID;
+            AttachDevice(current);
             deviceFixedVolume = IsFixedVolume(current);
             Log.Write($"output device: {current.FriendlyName}{(deviceFixedVolume ? " (fixed volume)" : "")}");
         }
         catch (Exception e)
         {
             if (device != null) Log.Write($"no default output device: {e.Message}");
-            device?.Dispose();
-            device = null;
-            deviceId = null;
+            DetachDevice();
         }
     }
 
@@ -322,10 +423,8 @@ sealed class AudioBackend : IDisposable
 
     public void Dispose()
     {
-        foreach (var list in sessionsById.Values)
-            foreach (var s in list) s.Dispose();
+        DetachDevice();
         foreach (var p in processes.Values) p.Dispose();
-        device?.Dispose();
         enumerator.Dispose();
     }
 
