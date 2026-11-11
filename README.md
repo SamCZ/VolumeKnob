@@ -30,9 +30,12 @@ repository: <https://github.com/Elecrow-RD/CrowPanel-1.28inch-HMI-ESP32-Rotary-D
 
 - Turning faster changes the volume in bigger steps. Turning a muted channel unmutes it, as in
   Windows.
+- The app list wraps around: after the last app comes the first, and before the first comes
+  the last.
 - The app list and app screens return to the master screen after 15 s without input.
 - If the output device has a fixed volume (some headsets with a hardware dial report a 0 dB to
-  0 dB range), the master screen is read-only and shows "Fixed by device". App volumes still work.
+  0 dB range), Windows cannot change it. The master screen is then skipped and the app list
+  becomes the home screen: hold and the 15 s timeout return to the list.
 - Without the companion the knob shows "PC offline".
 
 Icons are sent once as 64×64 images and cached on the knob, in PSRAM. They are freed when no

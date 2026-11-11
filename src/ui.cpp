@@ -47,6 +47,7 @@ lv_obj_t *lValue;
 lv_obj_t *lIndex;
 lv_obj_t *lEmpty;
 std::vector<lv_obj_t *> lItems;
+std::vector<int> lItemD;  // each item's slot relative to the selection (0 = centre, -1 = left, ...)
 int listSel = 0;
 int listSelId = -1;
 
@@ -267,16 +268,41 @@ void refreshMaster(bool smooth) {
 void clearList() {
   for (lv_obj_t *item : lItems) lv_obj_delete(item);
   lItems.clear();
+  lItemD.clear();
 }
 
-void layoutList(bool smooth) {
-  for (size_t i = 0; i < lItems.size(); i++) {
+/**
+ * Slot of item i on the circular carousel: the offset from the selection, wrapped into
+ * [-n/2, n/2]. When two slots are equally far (even n), keep the one that continues the
+ * item's movement so it does not jump across the screen.
+ */
+int wrappedSlot(int i, int n, int expected) {
+  int d = ((i - listSel) % n + n) % n;
+  if (d > n / 2) d -= n;
+  if (n % 2 == 0 && abs(d) == n / 2 && expected == -d) d = -d;
+  return d;
+}
+
+/** Place the carousel items. `moved` is how far the selection just moved (0 = rebuild, no wrap). */
+void layoutList(bool smooth, int moved = 0) {
+  const int n = (int)lItems.size();
+  for (int i = 0; i < n; i++) {
     lv_obj_t *item = lItems[i];
-    int d = (int)i - listSel;
+    int expected = lItemD[i] - moved;
+    int d = wrappedSlot(i, n, expected);
+    // An item that went around the end enters from the far side instead of sliding across.
+    bool wrapped = smooth && moved != 0 && d != expected;
+    lItemD[i] = d;
     int ad = abs(d);
     int x = d * kItemSpacing;
     int scale = ad == 0 ? 256 : (ad == 1 ? 150 : 90);
     int opa = ad == 0 ? 255 : (ad == 1 ? 140 : 0);
+    if (wrapped && ad <= 2) {
+      lv_anim_delete(item, nullptr);
+      lv_obj_set_x(item, x + (moved > 0 ? kItemSpacing : -kItemSpacing));
+      lv_image_set_scale(item, 90);
+      lv_obj_set_style_image_opa(item, 0, 0);
+    }
     if (ad > 2) {
       lv_obj_add_flag(item, LV_OBJ_FLAG_HIDDEN);
       lv_anim_delete(item, nullptr);
@@ -336,6 +362,7 @@ void buildList() {
     lv_obj_t *item = makeIcon(viewList, app);
     lv_obj_align(item, LV_ALIGN_CENTER, 0, kListIconY);
     lItems.push_back(item);
+    lItemD.push_back(0);
   }
   layoutList(false);
   refreshListLabels();
@@ -369,6 +396,12 @@ void buildApp() {
 }
 
 /*---------------------------------------------------------------- navigation */
+
+/**
+ * Where hold and the idle timeout go. When Windows cannot change the output device's volume,
+ * the master screen has nothing to offer, so the app list takes its place.
+ */
+View homeView() { return g_model.online && g_model.masterFixed ? View::List : View::Master; }
 
 void showView(View v) {
   if (view == View::List && v != View::List) clearList();
@@ -469,7 +502,12 @@ void uiUpdate() {
     }
   }
 
-  if (view != View::Master && millis() - lastInputMs > kIdleTimeoutMs) showView(View::Master);
+  View home = homeView();
+  if (view == View::Master && home == View::List) {
+    showView(View::List);  // the output device just became fixed-volume (or the PC told us at sync)
+  } else if (view != home && millis() - lastInputMs > kIdleTimeoutMs) {
+    showView(home);
+  }
 }
 
 void uiRotate(int32_t detents) {
@@ -489,12 +527,13 @@ void uiRotate(int32_t detents) {
       break;
     }
     case View::List: {
-      if (m.apps.empty()) break;
-      int next = clampInt(listSel + (int)detents, 0, (int)m.apps.size() - 1);
-      if (next == listSel) break;
-      listSel = next;
+      const int n = (int)m.apps.size();
+      if (n < 2) break;
+      // Circular: past the last app comes the first, and back from the first comes the last.
+      int moved = clampInt((int)detents, -(n - 1), n - 1);
+      listSel = ((listSel + moved) % n + n) % n;
       listSelId = m.apps[listSel].id;
-      layoutList(true);
+      layoutList(true, moved);
       refreshListLabels();
       break;
     }
@@ -549,7 +588,7 @@ void uiDoubleClick() {
 
 void uiLongPress() {
   lastInputMs = millis();
-  if (view != View::Master) showView(View::Master);
+  if (view != homeView()) showView(homeView());
 }
 
 bool uiWantsDoubleClick() { return view != View::List; }

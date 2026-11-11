@@ -32,7 +32,7 @@ Volumes are integers 0-100, mute flags are `0` or `1`, icon keys are 8 hex digit
 | `S` | Start full sync. Every app the knob knows is marked stale. |
 | `E` | End full sync. Apps still stale are removed. |
 | `O <name>` | Name of the default output device. |
-| `G <vol> <mute> <fixed>` | Master volume. `fixed` = 1 when the output device has no adjustable volume (e.g. a headset with a hardware dial); the knob then shows it read-only. |
+| `G <vol> <mute> <fixed>` | Master volume. `fixed` = 1 when the output device has no adjustable volume (e.g. a headset with a hardware dial); the knob then skips the master screen and uses the app list as its home screen. |
 | `A <id> <iconKey> <vol> <mute> <name>` | Add or update an app (one volume-mixer entry). `name` is the rest of the line. |
 | `V <id> <vol> <mute>` | App volume changed. |
 | `R <id>` | App closed / left the mixer. |
